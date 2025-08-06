@@ -53,20 +53,52 @@ void setup() {
 
   // 初始化第一个 I2C 总线 (Wire: SDA=5, SCL=4) - OLED
   Wire.begin(5, 4);
+  Serial.println("正在初始化OLED显示屏...");
+  
+  // 扫描I2C设备
+  Serial.println("扫描I2C总线上的设备...");
+  byte error, address;
+  int nDevices = 0;
+  for(address = 1; address < 127; address++ ) {
+    Wire.beginTransmission(address);
+    error = Wire.endTransmission();
+    if (error == 0) {
+      Serial.print("发现I2C设备，地址: 0x");
+      if (address<16) Serial.print("0");
+      Serial.println(address,HEX);
+      nDevices++;
+    }
+  }
+  if (nDevices == 0) {
+    Serial.println("未发现任何I2C设备，请检查连接");
+  } else {
+    Serial.println("I2C扫描完成");
+  }
+
+  Serial.println("oled开始初始化...");
   oled.begin();
+  Serial.println("oled初始化结束");
+  if(oled.getDisplayWidth() > 0 && oled.getDisplayHeight() > 0) {
+    Serial.println("OLED初始化成功");
+    Serial.print("显示屏分辨率: ");
+    Serial.print(oled.getDisplayWidth());
+    Serial.print("x");
+    Serial.println(oled.getDisplayHeight());
+  } else {
+    Serial.println("OLED初始化失败，请检查连接和地址");
+  }
 
   // 初始化第二个 I2C 总线 (I2CBH1750: SDA=15, SCL=16) - BH1750
   I2CBH1750.begin(15, 16);  // SDA=15, SCL=16
-  // lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &I2CBH1750);  // 使用自定义 I2C 总线
 
-  // 检查 I2C 设备是否存在
-  byte error, address;
-  int nDevices = 0;
+  // 检查第二个I2C总线上的设备
+  Serial.println("扫描第二个I2C总线上的设备...");
+  nDevices = 0;
   for(address = 1; address < 127; address++ ) {
     I2CBH1750.beginTransmission(address);
     error = I2CBH1750.endTransmission();
     if (error == 0) {
-      Serial.print("I2C device found at address 0x");
+      Serial.print("发现I2C设备，地址: 0x");
       if (address<16) Serial.print("0");
       Serial.print(address,HEX);
       Serial.println("  !");
@@ -92,12 +124,19 @@ void setup() {
   dht.begin();          // 启动DHT11
 
   // 显示初始界面
+  Serial.println("尝试显示初始界面...");
   oled.clearBuffer();
   oled.setFont(u8g2_font_7x14B_tr);
   oled.drawStr(0, 15, "DHT11 Monitor");
   oled.setFont(u8g2_font_6x10_tr);
   oled.drawStr(0, 35, "Initializing...");
   oled.sendBuffer();
+  // 通过检查I2C错误来判断显示是否成功
+  if(Wire.getWriteError()) {
+    Serial.println("OLED显示失败 - I2C通信错误");
+  } else {
+    Serial.println("OLED显示命令已发送");
+  }
   delay(1000);
 
   WiFi.mode(WIFI_STA);                                              //设置 WiFi 连接
