@@ -47,84 +47,78 @@ void displayAllData(const SensorData& data);
 void displayOnOLED(const SensorData& data);
 void printToSerial(const SensorData& data);
 String getCurrentTime();
+void logWithTimestamp(const String& message);
 
 void setup() {
   Serial.begin(115200);
+  logWithTimestamp("系统启动");
 
   // 初始化第一个 I2C 总线 (Wire: SDA=5, SCL=4) - OLED
   Wire.begin(5, 4);
-  Serial.println("正在初始化OLED显示屏...");
+  logWithTimestamp("正在初始化OLED显示屏...");
   
   // 扫描I2C设备
-  Serial.println("扫描I2C总线上的设备...");
+  logWithTimestamp("扫描I2C总线上的设备...");
   byte error, address;
   int nDevices = 0;
   for(address = 1; address < 127; address++ ) {
     Wire.beginTransmission(address);
     error = Wire.endTransmission();
     if (error == 0) {
-      Serial.print("发现I2C设备，地址: 0x");
-      if (address<16) Serial.print("0");
-      Serial.println(address,HEX);
+      logWithTimestamp("发现I2C设备，地址: 0x" + String(address < 16 ? "0" : "") + String(address, HEX));
       nDevices++;
     }
   }
   if (nDevices == 0) {
-    Serial.println("未发现任何I2C设备，请检查连接");
+    logWithTimestamp("未发现任何I2C设备，请检查连接");
   } else {
-    Serial.println("I2C扫描完成");
+    logWithTimestamp("I2C扫描完成");
   }
 
-  Serial.println("oled开始初始化...");
+  logWithTimestamp("oled开始初始化...");
   oled.begin();
-  Serial.println("oled初始化结束");
+  logWithTimestamp("oled初始化结束");
   if(oled.getDisplayWidth() > 0 && oled.getDisplayHeight() > 0) {
-    Serial.println("OLED初始化成功");
-    Serial.print("显示屏分辨率: ");
-    Serial.print(oled.getDisplayWidth());
-    Serial.print("x");
-    Serial.println(oled.getDisplayHeight());
+    logWithTimestamp("OLED初始化成功");
+    logWithTimestamp("显示屏分辨率: " + String(oled.getDisplayWidth()) + "x" + String(oled.getDisplayHeight()));
   } else {
-    Serial.println("OLED初始化失败，请检查连接和地址");
+    logWithTimestamp("OLED初始化失败，请检查连接和地址");
   }
 
   // 初始化第二个 I2C 总线 (I2CBH1750: SDA=15, SCL=16) - BH1750
   I2CBH1750.begin(15, 16);  // SDA=15, SCL=16
 
   // 检查第二个I2C总线上的设备
-  Serial.println("扫描第二个I2C总线上的设备...");
+  logWithTimestamp("扫描第二个I2C总线上的设备...");
   nDevices = 0;
   for(address = 1; address < 127; address++ ) {
     I2CBH1750.beginTransmission(address);
     error = I2CBH1750.endTransmission();
     if (error == 0) {
-      Serial.print("发现I2C设备，地址: 0x");
-      if (address<16) Serial.print("0");
-      Serial.print(address,HEX);
-      Serial.println("  !");
+      logWithTimestamp("发现I2C设备，地址: 0x" + String(address < 16 ? "0" : "") + String(address, HEX) + " !");
       nDevices++;
     }
   }
   if (nDevices == 0) {
-    Serial.println("No I2C devices found");
+    logWithTimestamp("未发现任何I2C设备");
   }
 
   // 尝试两种可能的 BH1750 地址
   if(!lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &I2CBH1750)) {
-    Serial.println("Failed to initialize BH1750 at address 0x23, trying 0x5C");
+    logWithTimestamp("在地址0x23初始化BH1750失败，尝试0x5C");
     if(!lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x5C, &I2CBH1750)) {
-      Serial.println("Could not find a valid BH1750 sensor, check wiring!");
+      logWithTimestamp("无法找到有效的BH1750传感器，请检查接线!");
     } else {
-      Serial.println("BH1750 initialized at address 0x5C");
+      logWithTimestamp("BH1750在地址0x5C初始化成功");
     }
   } else {
-    Serial.println("BH1750 initialized at address 0x23");
+    logWithTimestamp("BH1750在地址0x23初始化成功");
   }
 
   dht.begin();          // 启动DHT11
 
   // 显示初始界面
-  Serial.println("尝试显示初始界面...");
+  logWithTimestamp("尝试显示初始界面...");
   oled.clearBuffer();
   oled.setFont(u8g2_font_7x14B_tr);
   oled.drawStr(0, 15, "DHT11 Monitor");
@@ -133,37 +127,50 @@ void setup() {
   oled.sendBuffer();
   // 通过检查I2C错误来判断显示是否成功
   if(Wire.getWriteError()) {
-    Serial.println("OLED显示失败 - I2C通信错误");
+    logWithTimestamp("OLED显示失败 - I2C通信错误");
   } else {
-    Serial.println("OLED显示命令已发送");
+    logWithTimestamp("OLED显示命令已发送");
   }
   delay(1000);
 
   WiFi.mode(WIFI_STA);                                              //设置 WiFi 连接
   wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
 
-  Serial.print("正在连接到 WiFi");                               //连接到 WiFi
-  while (wifiMulti.run() != WL_CONNECTED) 
-  {
-    Serial.print(".");
+  logWithTimestamp("正在连接到 WiFi...");                          //连接到 WiFi
+  unsigned long lastLogTime = 0;
+  int dotCount = 0;
+  
+  while (wifiMulti.run() != WL_CONNECTED) {
     delay(100);
+    
+    // 每5秒输出一次连接状态
+    if(millis() - lastLogTime > 5000) {
+      String dots;
+      for(int i=0; i<dotCount; i++) dots += ".";
+      logWithTimestamp("连接中" + dots);
+      
+      dotCount = (dotCount + 1) % 4;
+      lastLogTime = millis();
+    }
   }
-  Serial.println();
+
+  logWithTimestamp("WiFi连接成功");
+  logWithTimestamp("IP地址: " + WiFi.localIP().toString());
 
   sensor.addTag("device", DEVICE);                                   //添加标签 - 根据需要重复
   sensor.addTag("SSID", WIFI_SSID);
 
+  logWithTimestamp("开始NTP时间同步...");
   timeSync(TZ_INFO, "pool.ntp.org", "time.nis.gov");                 //准确时间对于证书验证和批量写入是必要的
 
+  logWithTimestamp("检查InfluxDB连接...");
   if (client.validateConnection())                                   //检查服务器连接
   {
-    Serial.print("已连接到 InfluxDB: ");
-    Serial.println(client.getServerUrl());
+    logWithTimestamp("已连接到InfluxDB: " + String(client.getServerUrl()));
   } 
   else 
   {
-    Serial.print("InfluxDB 连接失败: ");
-    Serial.println(client.getLastErrorMessage());
+    logWithTimestamp("InfluxDB连接失败: " + String(client.getLastErrorMessage()));
   }
 
 }
@@ -206,6 +213,7 @@ SensorData readSensorData() {
 // 上传数据到InfluxDB
 void uploadToInfluxDB(const SensorData& data) {
     if (!data.dhtValid && !data.bh1750Valid) {
+        logWithTimestamp("无有效传感器数据，跳过上传");
         return; // 无有效数据不上传
     }
 
@@ -222,14 +230,16 @@ void uploadToInfluxDB(const SensorData& data) {
 
     // 检查WiFi连接
     if (wifiMulti.run() != WL_CONNECTED) {
-        Serial.println("WiFi连接丢失");
+        logWithTimestamp("WiFi连接丢失");
         return;
     }
 
     // 写入数据
+    logWithTimestamp("正在上传数据到InfluxDB...");
     if (!client.writePoint(sensor)) {
-        Serial.print("InfluxDB写入失败: ");
-        Serial.println(client.getLastErrorMessage());
+        logWithTimestamp("InfluxDB写入失败: " + String(client.getLastErrorMessage()));
+    } else {
+        logWithTimestamp("数据上传成功");
     }
 }
 
@@ -311,29 +321,21 @@ void displayOnOLED(const SensorData& data) {
 
 // 串口打印函数
 void printToSerial(const SensorData& data) {
-    Serial.print("时间: ");
-    Serial.print(data.currentTime);
+    String logMessage = "传感器数据 - ";
     
     if (data.dhtValid) {
-        Serial.print(" | 温度: ");
-        Serial.print(data.temperature);
-        Serial.print("°C");
-        Serial.print(" | 湿度: ");
-        Serial.print(data.humidity);
-        Serial.print("%");
+        logMessage += "温度: " + String(data.temperature) + "°C | 湿度: " + String(data.humidity) + "%";
     } else {
-        Serial.print(" | DHT11读取失败");
+        logMessage += "DHT11读取失败";
     }
     
     if (data.bh1750Valid) {
-        Serial.print(" | 光照: ");
-        Serial.print(data.light);
-        Serial.print(" lx");
+        logMessage += " | 光照: " + String(data.light) + " lx";
     } else {
-        Serial.print(" | BH1750读取失败");
+        logMessage += " | BH1750读取失败";
     }
     
-    Serial.println();
+    logWithTimestamp(logMessage);
 }
 
 // 获取当前时间函数
@@ -346,4 +348,27 @@ String getCurrentTime() {
     char timeStr[20];
     strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
     return String(timeStr);
+}
+
+// 带时间戳的日志函数
+void logWithTimestamp(const String& message) {
+    static bool timeSynced = false;
+    static unsigned long startMillis = millis();
+    
+    Serial.print("[");
+    if(timeSynced) {
+        Serial.print(getCurrentTime());
+    } else {
+        // 在时间同步前使用系统运行时间(毫秒)
+        Serial.print(millis());
+        Serial.print("ms");
+        
+        // 检查是否已完成时间同步
+        struct tm timeinfo;
+        if(getLocalTime(&timeinfo, 0)) {
+            timeSynced = true;
+        }
+    }
+    Serial.print("] ");
+    Serial.println(message);
 }
