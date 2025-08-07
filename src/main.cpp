@@ -2,45 +2,92 @@
 //esp32s3 连接 dh11、光线传感器、oled显示屏，并把数据传输到 InfluxDB
 #include <Wire.h>
 #include <U8g2lib.h>
+#include <TFT_eSPI.h> // ST7789驱动库
 #include <DHT.h>
 #include <WiFiMulti.h>
 #include <BH1750.h>
 #include <InfluxDbClient.h>
 #include <InfluxDbCloud.h>
 
-// 定义传感器数据结构体（放在文件顶部）
-struct SensorData {
-    float temperature;
-    float humidity;
-    float light;
-    bool dhtValid;
-    bool bh1750Valid;
-    String currentTime;
-};
+// =============== 硬件配置 ===============
+#define DHTPIN 6
+#define DHTTYPE DHT11
 
-// 其他全局变量和初始化代码...
-WiFiMulti wifiMulti;
-#define DEVICE "ESP32s3"
+#define PIR_PIN 1          // HC-SR312连接引脚
+#define ENABLE_PIR 1       // 1-启用PIR传感器 0-禁用
+#define DISPLAY_TYPE 1     // 0-OLED 1-ST7789
+
+// ST7789引脚配置
+#define TFT_MOSI 11
+#define TFT_SCLK 12 
+#define TFT_CS   8
+#define TFT_DC   9
+#define TFT_RST  10
+#define TFT_BL   13  // 背光控制
+
+#define DEVICE "ESP32S3"
 
 #define WIFI_SSID "HUAWEI-10HA9N-2.4"
 #define WIFI_PASSWORD "wf20210612"
+
 #define INFLUXDB_URL "http://192.168.100.234:8086"
 #define INFLUXDB_TOKEN "eO0OXFtfIc4cL4z0NrEQQDmzQqsL1SUXbFGDVHmDATzkuhkZuhYQRjNm020QgOUuBQbW2RHavB4U8voHZMOsFQ=="
 #define INFLUXDB_ORG "pengchengcoltd"
 #define INFLUXDB_BUCKET "esp32"
-#define TZ_INFO "CST-8"
 
-InfluxDBClient client(INFLUXDB_URL, INFLUXDB_ORG, INFLUXDB_BUCKET, INFLUXDB_TOKEN);
-Point sensor("roomSensor");
+#define TZ_INFO "CST-8"
+#define PIR_WARMUP_TIME 60000  // HC-SR312需要60秒预热
+
+// =============== 全局对象 ===============
+WiFiMulti wifiMulti;
+
+DHT dht(DHTPIN, DHTTYPE);
 
 TwoWire I2CBH1750 = TwoWire(1);
-U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, 4, 5);
-#define DHTPIN 6
-#define DHTTYPE DHT11
-DHT dht(DHTPIN, DHTTYPE);
 BH1750 lightMeter;
 
-// 前置声明函数
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE, 4, 5);
+TFT_eSPI tft = TFT_eSPI(); // ST7789屏幕对象
+
+InfluxDBClient client(INFLUXDB_URL, INFLUXDB_ORG, INFLUXDB_BUCKET, INFLUXDB_TOKEN);
+// Point sensor("roomSensor");
+
+#define DISPLAY_BUF_SIZE 32
+char displayBuffer[DISPLAY_BUF_SIZE];
+
+// =============== PIR状态机 ===============
+enum PIRState {
+    PIR_UNINITIALIZED, //0
+    PIR_WARMING_UP, // 1
+    PIR_READY, // 2
+    PIR_ERROR // 3
+};
+
+PIRState pirStatus = PIR_UNINITIALIZED;
+unsigned long pirWarmupStartTime = 0;
+bool currentPirState = false;
+bool lastPirState = false;
+uint16_t motionCount = 0;
+
+// =============== 数据结构 ===============
+struct SensorData {
+    float temperature;
+    float humidity;
+    float light;
+
+    bool dhtValid;
+    bool bh1750Valid;
+
+    bool motionDetected;
+    uint16_t motionCount;
+    String pirStatus;
+
+    String currentTime;
+};
+
+// =============== 函数声明 ===============
+void initPIRSensorAsync();
+void updatePIRStatus();
 SensorData readSensorData();
 void uploadToInfluxDB(const SensorData& data);
 void displayAllData(const SensorData& data);
@@ -49,302 +96,457 @@ void printToSerial(const SensorData& data);
 String getCurrentTime();
 void logWithTimestamp(const String& message);
 
+// =============== 初始化 ===============
 void setup() {
-  Serial.begin(115200);
-  logWithTimestamp("系统启动");
+    Serial.begin(115200);
+    logWithTimestamp("系统启动");
 
-  // 初始化第一个 I2C 总线 (Wire: SDA=5, SCL=4) - OLED
-  Wire.begin(5, 4);
-  logWithTimestamp("正在初始化OLED显示屏...");
-  
-  // 扫描I2C设备
-  logWithTimestamp("扫描I2C总线上的设备...");
-  byte error, address;
-  int nDevices = 0;
-  for(address = 1; address < 127; address++ ) {
-    Wire.beginTransmission(address);
-    error = Wire.endTransmission();
-    if (error == 0) {
-      logWithTimestamp("发现I2C设备，地址: 0x" + String(address < 16 ? "0" : "") + String(address, HEX));
-      nDevices++;
+    // 显示设备初始化
+#if DISPLAY_TYPE == 0
+    // OLED初始化
+    Wire.begin(5, 4); // SDA=5, SCL=4
+    oled.begin();
+    oled.clearBuffer();
+    oled.setFont(u8g2_font_7x14B_tr);
+    oled.drawStr(0, 15, "System Init...");
+    oled.sendBuffer();
+#else
+    // ST7789初始化
+    tft.init();
+    tft.setRotation(1);
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor(0, 0);
+    tft.println("System Init...");
+#endif
+
+    // 传感器初始化
+    dht.begin();
+    I2CBH1750.begin(15, 16); // 第二个I2C总线
+    lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &I2CBH1750);
+    pinMode(PIR_PIN, INPUT_PULLUP);  // 启用内部上拉电阻
+    initPIRSensorAsync(); // 非阻塞启动PIR
+
+    // WiFi连接
+    WiFi.mode(WIFI_STA);
+    wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
+    logWithTimestamp("连接WiFi...");
+    while (wifiMulti.run() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
     }
-  }
-  if (nDevices == 0) {
-    logWithTimestamp("未发现任何I2C设备，请检查连接");
-  } else {
-    logWithTimestamp("I2C扫描完成");
-  }
+    logWithTimestamp("WiFi连接成功: " + WiFi.localIP().toString());
 
-  logWithTimestamp("oled开始初始化...");
-  oled.begin();
-  logWithTimestamp("oled初始化结束");
-  if(oled.getDisplayWidth() > 0 && oled.getDisplayHeight() > 0) {
-    logWithTimestamp("OLED初始化成功");
-    logWithTimestamp("显示屏分辨率: " + String(oled.getDisplayWidth()) + "x" + String(oled.getDisplayHeight()));
-  } else {
-    logWithTimestamp("OLED初始化失败，请检查连接和地址");
-  }
+    // InfluxDB配置
+    // sensor.addTag("device", DEVICE);
+    // sensor.addTag("SSID", WIFI_SSID);
+    timeSync(TZ_INFO, "pool.ntp.org", "time.nis.gov");
 
-  // 初始化第二个 I2C 总线 (I2CBH1750: SDA=15, SCL=16) - BH1750
-  I2CBH1750.begin(15, 16);  // SDA=15, SCL=16
-
-  // 检查第二个I2C总线上的设备
-  logWithTimestamp("扫描第二个I2C总线上的设备...");
-  nDevices = 0;
-  for(address = 1; address < 127; address++ ) {
-    I2CBH1750.beginTransmission(address);
-    error = I2CBH1750.endTransmission();
-    if (error == 0) {
-      logWithTimestamp("发现I2C设备，地址: 0x" + String(address < 16 ? "0" : "") + String(address, HEX) + " !");
-      nDevices++;
-    }
-  }
-  if (nDevices == 0) {
-    logWithTimestamp("未发现任何I2C设备");
-  }
-
-  // 尝试两种可能的 BH1750 地址
-  if(!lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x23, &I2CBH1750)) {
-    logWithTimestamp("在地址0x23初始化BH1750失败，尝试0x5C");
-    if(!lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x5C, &I2CBH1750)) {
-      logWithTimestamp("无法找到有效的BH1750传感器，请检查接线!");
+    if (client.validateConnection()) {
+        logWithTimestamp("InfluxDB连接成功");
     } else {
-      logWithTimestamp("BH1750在地址0x5C初始化成功");
+        logWithTimestamp("InfluxDB连接失败: " + String(client.getLastErrorMessage()));
     }
-  } else {
-    logWithTimestamp("BH1750在地址0x23初始化成功");
-  }
-
-  dht.begin();          // 启动DHT11
-
-  // 显示初始界面
-  logWithTimestamp("尝试显示初始界面...");
-  oled.clearBuffer();
-  oled.setFont(u8g2_font_7x14B_tr);
-  oled.drawStr(0, 15, "DHT11 Monitor");
-  oled.setFont(u8g2_font_6x10_tr);
-  oled.drawStr(0, 35, "Initializing...");
-  oled.sendBuffer();
-  // 通过检查I2C错误来判断显示是否成功
-  if(Wire.getWriteError()) {
-    logWithTimestamp("OLED显示失败 - I2C通信错误");
-  } else {
-    logWithTimestamp("OLED显示命令已发送");
-  }
-  delay(1000);
-
-  WiFi.mode(WIFI_STA);                                              //设置 WiFi 连接
-  wifiMulti.addAP(WIFI_SSID, WIFI_PASSWORD);
-
-  logWithTimestamp("正在连接到 WiFi...");                          //连接到 WiFi
-  unsigned long lastLogTime = 0;
-  int dotCount = 0;
-  
-  while (wifiMulti.run() != WL_CONNECTED) {
-    delay(100);
-    
-    // 每5秒输出一次连接状态
-    if(millis() - lastLogTime > 5000) {
-      String dots;
-      for(int i=0; i<dotCount; i++) dots += ".";
-      logWithTimestamp("连接中" + dots);
-      
-      dotCount = (dotCount + 1) % 4;
-      lastLogTime = millis();
-    }
-  }
-
-  logWithTimestamp("WiFi连接成功");
-  logWithTimestamp("IP地址: " + WiFi.localIP().toString());
-
-  sensor.addTag("device", DEVICE);                                   //添加标签 - 根据需要重复
-  sensor.addTag("SSID", WIFI_SSID);
-
-  logWithTimestamp("开始NTP时间同步...");
-  timeSync(TZ_INFO, "pool.ntp.org", "time.nis.gov");                 //准确时间对于证书验证和批量写入是必要的
-
-  logWithTimestamp("检查InfluxDB连接...");
-  if (client.validateConnection())                                   //检查服务器连接
-  {
-    logWithTimestamp("已连接到InfluxDB: " + String(client.getServerUrl()));
-  } 
-  else 
-  {
-    logWithTimestamp("InfluxDB连接失败: " + String(client.getLastErrorMessage()));
-  }
-
 }
 
+// =============== 主循环 ===============
 void loop() {
-    delay(2000); // 2秒采样间隔
+    updatePIRStatus(); // 必须首先调用
 
-    // 1. 读取传感器数据
-    SensorData data = readSensorData();
-    
-    // 2. 上传数据到InfluxDB
+    static unsigned long lastReadTime = 0;
+    if (millis() - lastReadTime >= 2000) { // 2秒采样周期
+        SensorData data = readSensorData();
+        
+    // 统一处理数据上传和显示
     uploadToInfluxDB(data);
-    
-    // 3. 显示数据到OLED和串口
     displayAllData(data);
+        
+        lastReadTime = millis();
+    }
+    delay(100); // 主循环延迟
 }
 
-// 读取所有传感器数据
+// =============== PIR传感器异步控制 ===============
+void initPIRSensorAsync() {
+    if (pirStatus == PIR_UNINITIALIZED) {
+#if ENABLE_PIR
+        pinMode(PIR_PIN, INPUT);
+        pirWarmupStartTime = millis();
+        pirStatus = PIR_WARMING_UP;
+        logWithTimestamp("HC-SR312开始异步预热");
+#else
+        pirStatus = PIR_ERROR;
+        logWithTimestamp("PIR传感器已禁用");
+#endif
+    }
+}
+
+void updatePIRStatus() {
+#if ENABLE_PIR
+    // 仅在启用时输出详细状态日志
+    static PIRState lastStatus = PIR_UNINITIALIZED;
+    if (pirStatus != lastStatus) {
+        logWithTimestamp("HC-SR312状态变更: " + String(pirStatus));
+        lastStatus = pirStatus;
+    }
+#else
+    // 禁用时只输出一次日志
+    static bool firstRun = true;
+    if (firstRun) {
+        logWithTimestamp("PIR传感器已禁用");
+        firstRun = false;
+    }
+    return;
+#endif
+
+    switch (pirStatus) {
+        case PIR_WARMING_UP:
+            if (millis() - pirWarmupStartTime > PIR_WARMUP_TIME) {
+                pirStatus = PIR_READY;
+                logWithTimestamp("HC-SR312预热完成");
+                
+                // 检查初始状态
+                if (digitalRead(PIR_PIN)) {
+                    logWithTimestamp("警告：PIR初始状态为触发");
+                }
+                
+                logWithTimestamp("PIR 预热完成，当前状态: " + String(digitalRead(PIR_PIN))); // 打印初始电平
+            }
+            break;
+            
+        case PIR_READY: {
+            // 状态读取与滤波
+            static uint32_t lastPirReadTime = 0;
+            static uint8_t stableCount = 0;
+            
+        
+            if (millis() - lastPirReadTime > 100) { // 100ms采样间隔
+                bool rawState = digitalRead(PIR_PIN);
+                
+#if ENABLE_PIR
+                // 仅在启用时输出调试信息
+                static uint32_t lastDebugTime = 0;
+                if (millis() - lastDebugTime > 5000) { // 每5秒输出一次调试信息
+                    logWithTimestamp("[DEBUG] PIR RAW: " + String(rawState));
+                    logWithTimestamp("[DEBUG] GPIO1 Voltage: " + String(analogRead(PIR_PIN)));
+                    lastDebugTime = millis();
+                }
+#endif
+
+                if (rawState != currentPirState) {
+                    if (++stableCount > 3) { // 连续3次确认
+                        currentPirState = rawState;
+                        stableCount = 0;
+                        
+                        if (currentPirState) {
+                            motionCount++;
+                            logWithTimestamp("运动检测触发");
+                        }
+                    }
+                } else {
+                    stableCount = 0;
+                }
+                
+                lastPirReadTime = millis();
+            }
+            break;
+        }
+    }
+}
+
+// =============== 数据采集 ===============
 SensorData readSensorData() {
     SensorData data;
-    
-    // 获取当前时间
     data.currentTime = getCurrentTime();
     
-    // 读取DHT11数据
+    // DHT11读取
     data.humidity = dht.readHumidity();
     data.temperature = dht.readTemperature();
     data.dhtValid = !(isnan(data.humidity) || isnan(data.temperature));
     
-    // 读取BH1750数据
+    // BH1750读取
     data.light = lightMeter.readLightLevel();
     data.bh1750Valid = (data.light >= 0);
-    if (!data.bh1750Valid) {
-        data.light = 0; // 默认值
+    if (!data.bh1750Valid) data.light = 0;
+    
+    // PIR状态
+    switch (pirStatus) {
+        case PIR_UNINITIALIZED: data.pirStatus = "uninitialized"; break;
+        case PIR_WARMING_UP: {
+            int remain = (PIR_WARMUP_TIME - (millis() - pirWarmupStartTime)) / 1000;
+            data.pirStatus = "warming_up_" + String(remain) + "s";
+            break;
+        }
+        case PIR_READY: 
+            data.pirStatus = "ready";
+            data.motionDetected = currentPirState;
+            data.motionCount = motionCount;
+            break;
+        case PIR_ERROR: data.pirStatus = "disabled"; break;
     }
     
     return data;
 }
 
-// 上传数据到InfluxDB
+// =============== 数据上传 ===============
 void uploadToInfluxDB(const SensorData& data) {
-    if (!data.dhtValid && !data.bh1750Valid) {
-        logWithTimestamp("无有效传感器数据，跳过上传");
-        return; // 无有效数据不上传
-    }
-
-    sensor.clearFields();
-    
-    if (data.dhtValid) {
-        sensor.addField("temperature", data.temperature);
-        sensor.addField("humidity", data.humidity);
-    }
-    
-    if (data.bh1750Valid) {
-        sensor.addField("light", data.light);
-    }
-
-    // 检查WiFi连接
-    if (wifiMulti.run() != WL_CONNECTED) {
-        logWithTimestamp("WiFi连接丢失");
+    // 1. 检查网络和服务
+    checkNetwork();
+    if (!checkInfluxServer()) {
+        
+        logWithTimestamp("InfluxDB 服务不可达");
         return;
     }
 
-    // 写入数据
-    logWithTimestamp("正在上传数据到InfluxDB...");
-    if (!client.writePoint(sensor)) {
-        logWithTimestamp("InfluxDB写入失败: " + String(client.getLastErrorMessage()));
-    } else {
-        logWithTimestamp("数据上传成功");
+    static String lastPirStatus = "";
+    static unsigned long lastUploadTime = 0;
+    
+    // === 创建新Point对象保留固定标签 ===
+    Point newPoint("roomSensor");
+    newPoint.addTag("device", DEVICE);
+    newPoint.addTag("SSID", WIFI_SSID);
+    
+    // === 动态标签 ===
+    if(data.pirStatus != lastPirStatus) {
+        newPoint.addTag("pir_status", data.pirStatus.c_str());
+        lastPirStatus = data.pirStatus;
+    }
+
+    // === 添加字段 ===
+    if(data.dhtValid) {
+        newPoint.addField("temperature", data.temperature);
+        newPoint.addField("humidity", data.humidity);
+    }
+    
+    if(data.bh1750Valid) {
+        newPoint.addField("light", data.light);
+    }
+
+#if ENABLE_PIR
+    if(pirStatus == PIR_READY) {
+        newPoint.addField("motion", data.motionDetected ? 1 : 0);
+        newPoint.addField("motion_count", data.motionCount);
+        
+        static bool lastMotionState = false;
+        if(data.motionDetected && !lastMotionState) {
+            newPoint.addField("motion_event", 1);
+        }
+        lastMotionState = data.motionDetected;
+    }
+#endif
+
+    // === 上传 ===
+    if(millis() - lastUploadTime > 2000 || 
+       (pirStatus == PIR_READY && data.motionDetected)) {
+        
+       logWithTimestamp("[DEBUG] 准备上传的数据: " + newPoint.toLineProtocol());
+        
+        if(client.writePoint(newPoint)) {
+            lastUploadTime = millis();
+            logWithTimestamp("数据上传成功");
+        } else {
+            logWithTimestamp("上传失败: ");
+            logWithTimestamp("错误代码: " + String(client.getLastStatusCode()));
+            logWithTimestamp("错误信息: " + String(client.getLastErrorMessage()));
+        }
     }
 }
 
-// 显示所有数据
+void checkNetwork() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi断开，尝试重连...");
+    WiFi.disconnect();
+    WiFi.reconnect();
+    delay(2000); // 等待重连
+  }
+}
+
+bool checkInfluxServer() {
+  HTTPClient http;
+  http.begin(INFLUXDB_URL);
+  int code = http.GET();
+  http.end();
+  return (code == 200 || code == 204); // InfluxDB健康检查通常返回204
+}
+
+
+// =============== 数据显示 ===============
 void displayAllData(const SensorData& data) {
-    // OLED显示
+#if DISPLAY_TYPE == 0
     displayOnOLED(data);
-    
-    // 串口打印
+#else
+    displayOnST7789(data);
+#endif
     printToSerial(data);
 }
 
-// Optimized OLED display for 128x64 (English only)
+void displayOnST7789(const SensorData& data) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextSize(2);
+    
+    // 第一行：标题 + 时间
+    tft.setCursor(0, 0);
+    tft.print("Room Monitor ");
+    tft.setTextSize(1);
+    tft.print(data.currentTime.c_str());
+    
+    // 第二行：温度
+    tft.setTextSize(2);
+    tft.setCursor(0, 20);
+    tft.print("Temp: ");
+    if(data.dhtValid) {
+        tft.print(data.temperature, 1);
+        tft.print("C");
+    } else {
+        tft.print("--.-C");
+    }
+    
+    // 第三行：湿度
+    tft.setCursor(0, 40);
+    tft.print("Humid: ");
+    if(data.dhtValid) {
+        tft.print(data.humidity, 0);
+        tft.print("%");
+    } else {
+        tft.print("--%");
+    }
+    
+    // 第四行：光照
+    tft.setCursor(0, 60);
+    tft.print("Light: ");
+    if(data.bh1750Valid) {
+        tft.print((int)data.light);
+        tft.print("lx");
+    } else {
+        tft.print("---lx");
+    }
+    
+    // 状态栏
+    tft.setTextSize(1);
+    tft.setCursor(0, 220);
+    tft.print("WiFi:");
+    tft.print((WiFi.status() == WL_CONNECTED) ? "OK" : "OFF");
+    tft.print("(");
+    tft.print(WiFi.RSSI());
+    tft.print("dBm)");
+    
+    tft.setCursor(180, 220);
+    tft.print("PIR:");
+    if(pirStatus == PIR_WARMING_UP) {
+        int remainSec = (PIR_WARMUP_TIME - (millis() - pirWarmupStartTime)) / 1000;
+        tft.printf("%02ds", remainSec);
+    } else if(pirStatus == PIR_READY) {
+        tft.print(data.motionDetected ? "ACT" : "---");
+    } else {
+        tft.print("DIS");
+    }
+}
+
 void displayOnOLED(const SensorData& data) {
+    // 使用静态缓冲区避免重复分配
+    static char displayBuffer[32];
+    
     oled.clearBuffer();
     
-    // Line 1: Title (left) + Full time (right)
+    // ===== 第一行：标题 + 时间 =====
     oled.setFont(u8g2_font_7x14B_tr);
-    oled.drawStr(0, 16, "Room Monitor");
+    oled.drawStr(0, 15, "Room Monitor");
     
     oled.setFont(u8g2_font_5x8_tr);
-    int timeWidth = oled.getStrWidth(data.currentTime.c_str());
-    oled.drawStr(128 - timeWidth, 12, data.currentTime.c_str());
+    oled.drawStr(90, 12, data.currentTime.c_str());
     
-    // Line 2-3: Big temperature and humidity
-    oled.setFont(u8g2_font_10x20_tr);
+    // ===== 第二行：核心数据（温湿度+光照）=====
+    oled.setFont(u8g2_font_7x14_tr); // 统一使用中等大小字体
     
-    // Temperature (left)
+    // 温度显示（左对齐）
     if(data.dhtValid) {
-        String tempStr = String(data.temperature, 1) + "C";
-        oled.drawStr(10, 34, tempStr.c_str());
+        snprintf(displayBuffer, sizeof(displayBuffer), "%.1fC", data.temperature);
     } else {
-        oled.drawStr(10, 34, "--.-C");
+        strncpy(displayBuffer, "--.-C", sizeof(displayBuffer));
     }
+    oled.drawStr(5, 35, displayBuffer);
     
-    // Humidity (right)
+    // 湿度显示（中间偏左）
     if(data.dhtValid) {
-        String humStr = String(data.humidity, 0) + "%";
-        int humWidth = oled.getStrWidth(humStr.c_str());
-        oled.drawStr(128 - humWidth - 10, 34, humStr.c_str());
+        snprintf(displayBuffer, sizeof(displayBuffer), "%.0f%%", data.humidity);
     } else {
-        oled.drawStr(100, 34, "--%");
+        strncpy(displayBuffer, "--%%", sizeof(displayBuffer)); // 注意双%转义
     }
+    oled.drawStr(50, 35, displayBuffer);
     
-    // Line 4: Light sensor data
-    oled.setFont(u8g2_font_7x14_tr);
-    oled.drawStr(10, 50, "Light:");
-    
+    // 光照显示（右对齐）
     if(data.bh1750Valid) {
-        String lightStr = String(data.light, 0) + " lx";
-        oled.drawStr(65, 50, lightStr.c_str());
+        snprintf(displayBuffer, sizeof(displayBuffer), "%dlx", (int)data.light);
     } else {
-        oled.drawStr(65, 50, "--- lx");
+        strncpy(displayBuffer, "---lx", sizeof(displayBuffer));
     }
+    oled.drawStr(90, 35, displayBuffer);
     
-    // Status bar (bottom line)
-    oled.setFont(u8g2_font_5x8_tr);
-    oled.drawHLine(0, 54, 128);
+    // ===== 分隔线 =====
+    oled.setDrawColor(1);
+    oled.drawHLine(0, 40, 128); // 上移分隔线
     
-    // WiFi status
-    String wifiStatus = (wifiMulti.run() == WL_CONNECTED) ? "WiFi:OK" : "WiFi:FAIL";
-    oled.drawStr(5, 63, wifiStatus.c_str());
+    // ===== 第三行：数据标签 ===== 
+    oled.setFont(u8g2_font_5x8_tr); // 小字体标签
+    oled.drawStr(5, 50, "Temp");
+    oled.drawStr(50, 50, "Humid");
+    oled.drawStr(90, 50, "Light");
     
-    // DB status
-    String dbStatus = client.isBufferEmpty() ? "DB:OK" : "DB:FAIL";
-    oled.drawStr(50, 63, dbStatus.c_str());
+    // ===== 状态栏 =====
+    oled.drawHLine(0, 54, 128); // 状态栏分隔线
     
-    // Sensor errors
-    String sensorStatus = "";
-    if(!data.dhtValid) sensorStatus += "DHT11 ";
-    if(!data.bh1750Valid) sensorStatus += "BH1750";
-    if(sensorStatus.length() > 0) {
-        int statusWidth = oled.getStrWidth(sensorStatus.c_str());
-        oled.drawStr(128 - statusWidth - 5, 63, sensorStatus.c_str());
+    // WiFi状态（左对齐）
+    snprintf(displayBuffer, sizeof(displayBuffer), "WiFi:%s(%ddBm)", 
+        (WiFi.status() == WL_CONNECTED) ? "OK" : "OFF",
+        WiFi.RSSI());
+    oled.drawStr(2, 63, displayBuffer);
+    
+    // PIR状态（右对齐）
+    if(pirStatus == PIR_WARMING_UP) {
+        int remainSec = (PIR_WARMUP_TIME - (millis() - pirWarmupStartTime)) / 1000;
+        snprintf(displayBuffer, sizeof(displayBuffer), "PIR:%02ds", remainSec); // 两位数显示
+    } else if(pirStatus == PIR_READY) {
+        snprintf(displayBuffer, sizeof(displayBuffer), "PIR:%s", 
+            data.motionDetected ? "ACT" : "---");
+    } else {
+        snprintf(displayBuffer, sizeof(displayBuffer), "PIR:DIS");
     }
+    oled.drawStr(90, 63, displayBuffer);
     
     oled.sendBuffer();
 }
 
-// 串口打印函数
+
+
 void printToSerial(const SensorData& data) {
-    String logMessage = "传感器数据 - ";
-    
+    String logMsg = "数据 => ";
     if (data.dhtValid) {
-        logMessage += "温度: " + String(data.temperature) + "°C | 湿度: " + String(data.humidity) + "%";
+        logMsg += "温度:" + String(data.temperature) + "C 湿度:" + String(data.humidity) + "% ";
     } else {
-        logMessage += "DHT11读取失败";
+        logMsg += "DHT11无效 ";
     }
     
-    if (data.bh1750Valid) {
-        logMessage += " | 光照: " + String(data.light) + " lx";
+    logMsg += "光照:" + (data.bh1750Valid ? String(data.light) + "lx " : "N/A ");
+    
+    if (pirStatus == PIR_READY) {
+        logMsg += "运动:" + String(data.motionDetected ? "是" : "否") + 
+                 " 计数:" + String(data.motionCount);
     } else {
-        logMessage += " | BH1750读取失败";
+        logMsg += "PIR:" + data.pirStatus;
     }
     
-    logWithTimestamp(logMessage);
+    logWithTimestamp(logMsg);
+    Serial.println();
 }
 
-// 获取当前时间函数
+// =============== 工具函数 ===============
 String getCurrentTime() {
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo)) {
         return "NTP Error";
     }
-    
     char timeStr[20];
     strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
     return String(timeStr);
@@ -371,4 +573,12 @@ void logWithTimestamp(const String& message) {
     }
     Serial.print("] ");
     Serial.println(message);
+}
+
+void safeDrawStr(u8g2_uint_t x, u8g2_uint_t y, const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    vsnprintf(displayBuffer, DISPLAY_BUF_SIZE, format, args);
+    va_end(args);
+    oled.drawStr(x, y, displayBuffer);
 }
