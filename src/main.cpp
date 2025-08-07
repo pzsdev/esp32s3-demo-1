@@ -9,21 +9,17 @@
 #include <InfluxDbClient.h>
 #include <InfluxDbCloud.h>
 
+// =============== 函数声明 ===============
+void checkNetwork();
+bool checkInfluxServer();
+
 // =============== 硬件配置 ===============
 #define DHTPIN 6
 #define DHTTYPE DHT11
 
 #define PIR_PIN 1          // HC-SR312连接引脚
-#define ENABLE_PIR 1       // 1-启用PIR传感器 0-禁用
+#define ENABLE_PIR 0       // 1-启用PIR传感器 0-禁用
 #define DISPLAY_TYPE 1     // 0-OLED 1-ST7789
-
-// ST7789引脚配置
-#define TFT_MOSI 11
-#define TFT_SCLK 12 
-#define TFT_CS   8
-#define TFT_DC   9
-#define TFT_RST  10
-#define TFT_BL   13  // 背光控制
 
 #define DEVICE "ESP32S3"
 
@@ -92,9 +88,12 @@ SensorData readSensorData();
 void uploadToInfluxDB(const SensorData& data);
 void displayAllData(const SensorData& data);
 void displayOnOLED(const SensorData& data);
+void displayOnST7789(const SensorData& data);
 void printToSerial(const SensorData& data);
 String getCurrentTime();
 void logWithTimestamp(const String& message);
+void checkNetwork();
+bool checkInfluxServer();
 
 // =============== 初始化 ===============
 void setup() {
@@ -111,14 +110,15 @@ void setup() {
     oled.drawStr(0, 15, "System Init...");
     oled.sendBuffer();
 #else
-    // ST7789初始化
-    tft.init();
-    tft.setRotation(1);
+    // ST7789初始化 - 简化版本
+    tft.begin();
+    tft.setRotation(1); // 根据实际显示方向调整
     tft.fillScreen(TFT_BLACK);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
     tft.setTextSize(2);
     tft.setCursor(0, 0);
     tft.println("System Init...");
+    delay(1000); // 确保显示稳定
 #endif
 
     // 传感器初始化
